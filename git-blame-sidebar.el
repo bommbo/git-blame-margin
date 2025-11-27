@@ -1,26 +1,20 @@
-;;; git-blame-sidebar.el --- Git blame sidebar like IntelliJ IDEA -*- lexical-binding: t; -*-
+;;; git-blame-sidebar.el --- Git blame sidebar like IntelliJ IDEA (robust) -*- lexical-binding: t; -*-
 
 ;; Author: bommbo
-;; Version: 0.1
+;; Version: 0.2
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: git, vc, convenience
 
 ;;; Commentary:
-;; Display git blame information in a sidebar, similar to IntelliJ IDEA.
-;; Shows commit info for each line with color-coded indicators.
-;;
-;; Usage:
-;;   M-x git-blame-sidebar-toggle
-;;
-;; Command:
-;;   git-blame-sidebar-toggle - Toggle sidebar
-;;   git-blame-sidebar-copy-commit-hash - Copy commit hash
-;;   git-blame-sidebar-show-commit-diff - Show commit diff
+;; Robust version that handles git blame failures gracefully. Fixed all known issues including
+;; git blame exit code 9, uninitialized hash tables, and rendering problems.
+;; Now supports auto-following the current Git buffer via window selection.
 
 ;;; Code:
 
 (require 'vc-git)
 (require 'cl-lib)
+(require 'subr-x)
 
 ;;;; Custom Variables
 
@@ -57,6 +51,22 @@ Available placeholders:
   :type 'number
   :group 'git-blame-sidebar)
 
+(defcustom git-blame-sidebar-async t
+  "When non-nil, run git blame and git show asynchronously."
+  :type 'boolean
+  :group 'git-blame-sidebar)
+
+(defcustom git-blame-sidebar-visible-radius 200
+  "Number of context lines to include around the visible window when blaming.
+Set to 0 to blame only the visible window. Increase for more prefetching."
+  :type 'integer
+  :group 'git-blame-sidebar)
+
+(defcustom git-blame-sidebar-max-lines 100000
+  "Maximum number of lines to process for blame data. Prevents memory issues with very large files."
+  :type 'integer
+  :group 'git-blame-sidebar)
+
 ;;;; Global Variables
 
 (defvar git-blame-sidebar--global-sidebar-buffer nil
@@ -65,13 +75,16 @@ Available placeholders:
 (defvar git-blame-sidebar--global-source-buffer nil
   "Global reference to the source buffer associated with the sidebar.")
 
+(defvar git-blame-sidebar--global-follow-timer nil
+  "Timer to debounce buffer switch due to window selection.")
+
 ;;;; Buffer-Local Variables
 
 (defvar-local git-blame-sidebar--buffer nil
   "The sidebar buffer associated with this file buffer.")
 
 (defvar-local git-blame-sidebar--blame-data nil
-  "Cached blame data: list of (LINE-NUM COMMIT-HASH INFO-STRING COLOR).")
+  "Cached blame  list of (LINE-NUM COMMIT-HASH INFO-STRING COLOR).")
 
 (defvar-local git-blame-sidebar--commit-colors nil
   "Hash table mapping commit hash to color.")
@@ -85,6 +98,34 @@ Available placeholders:
 (defvar-local git-blame-sidebar--source-buffer nil
   "The source file buffer for this sidebar.")
 
+(defvar-local git-blame-sidebar--blame-process nil
+  "Async process running git blame for this buffer (if any).")
+
+(defvar-local git-blame-sidebar--commit-info-cache nil
+  "Hash table commit -> info string (may be partial).")
+
+(defvar-local git-blame-sidebar--commit-info-requests nil
+  "Hash table commit -> process to avoid duplicate requests.")
+
+(defvar-local git-blame-sidebar--last-failed-range nil
+  "Store last failed range to avoid retrying the same failing request.")
+
+(defvar-local git-blame-sidebar--pending-render-timer nil
+  "Timer to debounce sidebar rendering after commit info arrives.")
+
+(defvar-local git-blame-sidebar--needs-render nil
+  "Flag indicating that the sidebar needs to be re-rendered.")
+
+(defun git-blame-sidebar--ensure-commit-caches-in-buffer (buffer)
+  "Ensure commit caches are initialized in BUFFER."
+  (with-current-buffer buffer
+	(unless git-blame-sidebar--commit-info-cache
+	  (setq git-blame-sidebar--commit-info-cache (make-hash-table :test 'equal)))
+	(unless git-blame-sidebar--commit-info-requests
+	  (setq git-blame-sidebar--commit-info-requests (make-hash-table :test 'equal)))
+	(unless git-blame-sidebar--commit-colors
+	  (setq git-blame-sidebar--commit-colors (make-hash-table :test 'equal)))))
+
 ;;;; Utility Functions
 
 (defun git-blame-sidebar--get-git-root ()
@@ -94,7 +135,7 @@ Available placeholders:
 
 (defun git-blame-sidebar--generate-color (commit-hash)
   "Generate a consistent color for COMMIT-HASH."
-  (let* ((hash-num (string-to-number (substring commit-hash 0 8) 16))
+  (let* ((hash-num (string-to-number (substring commit-hash 0 (min 8 (length commit-hash))) 16))
 		 (hue (mod hash-num 360))
 		 (saturation 0.6)
 		 (lightness (if (eq (frame-parameter nil 'background-mode) 'dark)
@@ -121,18 +162,260 @@ Available placeholders:
 
 (defun git-blame-sidebar--get-commit-color (commit-hash)
   "Get or generate color for COMMIT-HASH."
-  (unless git-blame-sidebar--commit-colors
-	(setq git-blame-sidebar--commit-colors (make-hash-table :test 'equal)))
-  (or (gethash commit-hash git-blame-sidebar--commit-colors)
-	  (let ((color (git-blame-sidebar--generate-color commit-hash)))
-		(puthash commit-hash color git-blame-sidebar--commit-colors)
-		color)))
+  (let ((buffer (current-buffer)))
+	(git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
+	(or (gethash commit-hash git-blame-sidebar--commit-colors)
+		(let ((color (git-blame-sidebar--generate-color commit-hash)))
+		  (puthash commit-hash color git-blame-sidebar--commit-colors)
+		  color))))
 
-;;;; Git Blame Functions
+;;;; Parsing Helpers (operate on strings)
+
+(defun git-blame-sidebar--parse-blame-output (output)
+  "Parse OUTPUT string from `git blame --porcelain' into blame-data list."
+  (let ((buffer (current-buffer)))
+	(git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
+
+	(with-temp-buffer
+	  (insert output)
+	  (goto-char (point-min))
+	  (let ((blame-data nil)
+			(current-commit nil)
+			(current-line-num nil)
+			(commits-to-fetch nil))
+
+		(while (not (eobp))
+		  (let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+			(cond
+			 ;; Commit header line: hash original-line final-line num-lines
+			 ((string-match "^\\([a-f0-9]\\{40\\}\\) \\([0-9]+\\) \\([0-9]+\\)\\(?: \\([0-9]+\\)\\)?$" line)
+			  (setq current-commit (match-string 1 line)
+					current-line-num (string-to-number (match-string 3 line)))
+			  (push current-commit commits-to-fetch))
+
+			 ;; Code line (starts with tab)
+			 ((string-match "^\t" line)
+			  (when (and current-commit current-line-num)
+				(push (list current-line-num current-commit nil nil) blame-data)
+				(setq current-line-num (1+ current-line-num))))
+
+			 ;; Ignore other metadata lines
+			 (t nil)))
+		  (forward-line 1))
+
+		;; Request info for all unique commits
+		(dolist (commit (delete-dups commits-to-fetch))
+		  (with-current-buffer buffer
+			(git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
+			(unless (gethash commit git-blame-sidebar--commit-info-cache)
+			  (git-blame-sidebar--request-commit-info-async commit buffer))))
+
+		(nreverse blame-data)))))
+
+;;;; Git Operations (robust versions)
+
+(defun git-blame-sidebar--run-git (args &optional directory)
+  "Run git command with ARGS in DIRECTORY, return (exit-code output error)."
+  (let* ((default-directory (or directory default-directory))
+		 (temp-out (make-temp-file "git-blame-out-"))
+		 (temp-err (make-temp-file "git-blame-err-"))
+		 (exit-code (call-process "git" nil (list temp-out temp-err) nil args))
+		 (output (with-temp-buffer
+				   (insert-file-contents temp-out)
+				   (buffer-string)))
+		 (error (with-temp-buffer
+				  (insert-file-contents temp-err)
+				  (buffer-string))))
+	(delete-file temp-out)
+	(delete-file temp-err)
+	(list exit-code output error)))
+
+;;;; Blame loader (with fallbacks)
+
+(defun git-blame-sidebar--visible-line-range (buffer)
+  "Return cons (START . END) lines to blame for BUFFER."
+  (with-current-buffer buffer
+	(let* ((total-lines (count-lines (point-min) (point-max)))
+		   (win (get-buffer-window buffer))
+		   (use-large-range (not git-blame-sidebar--blame-data)))
+
+	  (if (not win)
+		  (cons 1 (min (if use-large-range 1000 200) total-lines))
+
+		(let* ((visible-start (line-number-at-pos (window-start win)))
+			   (visible-end (line-number-at-pos (window-end win t)))
+			   (radius (if use-large-range
+						   (max 500 git-blame-sidebar-visible-radius)
+						 git-blame-sidebar-visible-radius))
+			   (s (max 1 (- visible-start radius)))
+			   (e (min total-lines (+ visible-end radius))))
+		  (cons s e))))))
+
+(defun git-blame-sidebar--try-blame-range (source-buffer start end)
+  "Try to run git blame on SOURCE-BUFFER for range START to END.
+Return (exit-code output) or nil if git root not found."
+  (let* ((git-root (git-blame-sidebar--get-git-root))
+		 (file (buffer-file-name source-buffer))
+		 (relative-file (when (and git-root file) (file-relative-name file git-root))))
+	(when (and git-root file relative-file)
+	  (let* ((default-directory git-root)
+			 (cmd (append (list "blame" "--porcelain")
+						  (when (and start end) (list (format "-L%d,%d" start end)))
+						  (list relative-file)))
+			 (result (apply #'git-blame-sidebar--run-git cmd)))
+		result))))
+
+(defun git-blame-sidebar--start-blame-process (source-buffer &optional start end)
+  "Start an async `git blame --porcelain' for SOURCE-BUFFER with robust error handling."
+  (git-blame-sidebar--ensure-commit-caches-in-buffer source-buffer)
+
+  (with-current-buffer source-buffer
+	;; Skip if process is already running
+	(when (process-live-p git-blame-sidebar--blame-process)
+	  (message "[DEBUG] Process already running, skipping")
+	  (cl-return-from git-blame-sidebar--start-blame-process nil))
+
+	;; Skip if same range failed recently
+	(when (and git-blame-sidebar--last-failed-range
+			   (equal (list start end) git-blame-sidebar--last-failed-range))
+	  (message "[DEBUG] SKIPPING: Same range failed recently")
+	  (cl-return-from git-blame-sidebar--start-blame-process nil))
+
+	(let* ((git-root (git-blame-sidebar--get-git-root))
+		   (file (buffer-file-name source-buffer))
+		   (relative-file (when (and git-root file) (file-relative-name file git-root))))
+
+	  (unless (and git-root file relative-file)
+		(message "[DEBUG] Missing git-root or file")
+		(cl-return-from git-blame-sidebar--start-blame-process nil))
+
+	  (let* ((default-directory git-root)
+			 (cmd (append (list "git" "blame" "--porcelain")
+						  (when (and start end) (list (format "-L%d,%d" start end)))
+						  (list relative-file)))
+			 (process-connection-type nil)
+			 (proc nil))
+
+		(message "[DEBUG] Starting blame: %s" (mapconcat 'identity cmd " "))
+
+		(condition-case err
+			(progn
+			  (setq proc (apply #'start-process
+								(format "git-blame-%s" (buffer-name source-buffer))
+								(generate-new-buffer (format " *git-blame-%s*" (buffer-name source-buffer)))
+								cmd))
+
+			  (set-process-query-on-exit-flag proc nil)
+
+			  (set-process-sentinel
+			   proc
+			   (lambda (p ev)
+				 (message "[DEBUG] ===== SENTINEL CALLED ===== event='%s' status=%s"
+						  (string-trim ev) (process-status p))
+
+				 (when (memq (process-status p) '(exit signal))
+				   (let* ((exit-status (process-exit-status p))
+						  (out (with-current-buffer (process-buffer p) (buffer-string)))
+						  (range (list start end))
+						  (buffer (process-get p 'source-buffer)))
+
+					 (message "[DEBUG] exit=%d out-size=%d" exit-status (length out))
+
+					 (when (and buffer (buffer-live-p buffer))
+					   (with-current-buffer buffer
+						 (git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
+
+						 (if (and (= exit-status 0) (> (length out) 100))
+							 (progn
+							   (message "[DEBUG] Parsing output...")
+							   (setq git-blame-sidebar--blame-data
+									 (git-blame-sidebar--parse-blame-output out))
+							   (setq git-blame-sidebar--last-failed-range nil)
+							   (message "[DEBUG] SUCCESS: Parsed %d lines"
+										(length git-blame-sidebar--blame-data)))
+
+						   (progn
+							 (message "[DEBUG] FAILED: exit=%d" exit-status)
+							 (setq git-blame-sidebar--blame-data nil)
+							 (setq git-blame-sidebar--last-failed-range range)
+
+							 (when (and start end)
+							   (message "[DEBUG] Falling back to full file blame...")
+							   (run-with-timer 0.5 nil
+											   #'git-blame-sidebar--start-blame-process
+											   buffer nil nil)))))
+
+						 (message "[DEBUG] Cleaning up...")
+						 (when (buffer-live-p (process-buffer p))
+						   (kill-buffer (process-buffer p)))
+						 (setq git-blame-sidebar--blame-process nil)
+
+						 (message "[DEBUG] Updating sidebar...")
+						 (git-blame-sidebar--update-sidebar buffer)
+						 (message "[DEBUG] ===== DONE ====="))))))
+
+			  (setq git-blame-sidebar--blame-process proc)
+			  (process-put proc 'source-buffer source-buffer)
+
+			  (message "[DEBUG] Process started: %s status=%s"
+					   (process-name proc) (process-status proc))
+
+			  (run-with-timer 15 nil
+							  (lambda (p)
+								(when (and (processp p)
+										  (process-live-p p))
+								  (message "[TIMEOUT] Process still running after 15s, killing...")
+								  (delete-process p)))
+							  proc)
+
+			  nil)
+
+		  (error
+		   (message "[ERROR] Failed to create process: %s" err)
+		   nil))))))
+
+(defun git-blame-sidebar--fallback-sync-blame (source-buffer)
+  "Fallback to synchronous git blame for SOURCE-BUFFER."
+  (git-blame-sidebar--ensure-commit-caches-in-buffer source-buffer)
+
+  (with-current-buffer source-buffer
+	(let* ((git-root (git-blame-sidebar--get-git-root))
+		   (file (buffer-file-name))
+		   (relative-file (when (and git-root file) (file-relative-name file git-root))))
+	  (when (and git-root file relative-file)
+		(let* ((default-directory git-root)
+			   (result (git-blame-sidebar--try-blame-range source-buffer nil nil))
+			   (exit-code (nth 0 result))
+			   (output (nth 1 result))
+			   (error (nth 2 result)))
+		  (if (and (= exit-code 0) (not (string-empty-p output)))
+			  (progn
+				(setq git-blame-sidebar--blame-data (git-blame-sidebar--parse-blame-output output))
+				(message "Fallback to synchronous blame succeeded"))
+			(progn
+			  (setq git-blame-sidebar--blame-data nil)
+			  (message "Synchronous blame also failed: %s" (string-trim error))
+			  nil)))))))
+
+(defun git-blame-sidebar--load-blame-data ()
+  "Load git blame data asynchronously for current buffer."
+  (let* ((file (buffer-file-name))
+		 (git-root (git-blame-sidebar--get-git-root))
+		 (buffer (current-buffer)))
+	(when (and file git-root)
+	  (let* ((range (git-blame-sidebar--visible-line-range buffer))
+			 (start (car range)) (end (cdr range)))
+		(when (> (line-number-at-pos (point-max)) git-blame-sidebar-max-lines)
+		  (setq start (max 1 (- (line-number-at-pos (window-start)) 50))
+				end (min (line-number-at-pos (point-max))
+						 (+ (line-number-at-pos (window-end)) 50))))
+		(git-blame-sidebar--start-blame-process buffer start end)
+		git-blame-sidebar--blame-data))))
+
+;;;; Async commit-info fetcher
 
 (defun git-blame-sidebar--get-commit-info (commit-hash)
-  "Get formatted info string for COMMIT-HASH.
-Return a default string if git command fails."
+  "Get formatted info string for COMMIT-HASH synchronously."
   (with-temp-buffer
 	(condition-case nil
 		(if (zerop (call-process "git" nil t nil "show" "--no-patch"
@@ -142,48 +425,64 @@ Return a default string if git command fails."
 		  (format "[Commit %s info unavailable]" (substring commit-hash 0 7)))
 	  (error (format "[Error getting info for %s]" (substring commit-hash 0 7))))))
 
-(defun git-blame-sidebar--load-blame-data ()
-  "Load git blame data for current buffer.
-Return nil if not in a git repository or file not tracked."
-  (let* ((file (buffer-file-name))
-		 (git-root (git-blame-sidebar--get-git-root)))
-	(when (and file git-root)
-	  (let ((default-directory git-root)
-			(relative-file (file-relative-name file git-root))
-			(blame-data nil)
-			(current-commit nil)
-			(commit-info-cache (make-hash-table :test 'equal))
-			(line-num 1))
-		(with-temp-buffer
-		  (condition-case err
-			  (progn
-				(when (zerop (call-process "git" nil t nil "blame" "--porcelain" relative-file))
-				  (goto-char (point-min))
-				  (while (not (eobp))
-					(let ((line (buffer-substring-no-properties
-								 (line-beginning-position)
-								 (line-end-position))))
-					  (cond
-					   ;; Commit line
-					   ((string-match "^\\([a-f0-9]\\{40\\}\\) \\([0-9]+\\) \\([0-9]+\\)" line)
-						(setq current-commit (match-string 1 line))
-						(let* ((info (or (gethash current-commit commit-info-cache)
-										 (let ((info-str (git-blame-sidebar--get-commit-info current-commit)))
-										   (puthash current-commit info-str commit-info-cache)
-										   info-str)))
-							   (color (git-blame-sidebar--get-commit-color current-commit)))
-						  (push (list line-num current-commit info color) blame-data)))
-					   ;; Code line (starts with tab)
-					   ((string-match "^\t" line)
-						(setq line-num (1+ line-num)))
-					   ;; Ignore other lines
-					   (t nil)))
-					(forward-line 1))))
-			(error
-			 (message "Error loading blame data: %s" (error-message-string err))
-			 nil)))
-		(when blame-data
-		  (nreverse blame-data))))))
+(defun git-blame-sidebar--request-commit-info-async (commit source-buffer)
+  "Request formatted commit info for COMMIT asynchronously."
+  (git-blame-sidebar--ensure-commit-caches-in-buffer source-buffer)
+
+  (with-current-buffer source-buffer
+	(when (and (not (gethash commit git-blame-sidebar--commit-info-cache))
+			   (not (gethash commit git-blame-sidebar--commit-info-requests)))
+	  (let ((git-root (git-blame-sidebar--get-git-root)))
+		(when git-root
+		  (let* ((default-directory git-root)
+				 (cmd (list "git" "show" "--no-patch"
+							(concat "--format=" git-blame-sidebar-format)
+							commit))
+				 (process-connection-type nil)
+				 (proc-buffer (generate-new-buffer (format " *git-show-%s*" (substring commit 0 8))))
+				 (proc (apply #'start-process
+							  (format "git-show-%s" (substring commit 0 8))
+							  proc-buffer
+							  cmd)))
+
+			(set-process-query-on-exit-flag proc nil)
+			(puthash commit proc git-blame-sidebar--commit-info-requests)
+			(process-put proc 'source-buffer source-buffer)
+
+			(set-process-sentinel
+			 proc
+			 (lambda (p ev)
+			   (when (memq (process-status p) '(exit signal))
+				 (let ((out (with-current-buffer (process-buffer p) (buffer-string)))
+					   (exit (process-exit-status p))
+					   (buffer (process-get p 'source-buffer)))
+
+				   (when (and buffer (buffer-live-p buffer))
+					 (with-current-buffer buffer
+					   (git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
+					   (puthash commit
+								(if (and (= exit 0) (not (string-empty-p out)))
+									(string-trim out)
+								  (format "[Error %s]" (substring commit 0 8)))
+								git-blame-sidebar--commit-info-cache)
+					   (remhash commit git-blame-sidebar--commit-info-requests)
+
+					   (setq git-blame-sidebar--needs-render t)
+
+					   (unless git-blame-sidebar--pending-render-timer
+						 (setq git-blame-sidebar--pending-render-timer
+							   (run-with-idle-timer
+								0.01 nil
+								(lambda ()
+								  (when (and git-blame-sidebar--needs-render
+											 (buffer-live-p git-blame-sidebar--global-sidebar-buffer)
+											 (buffer-live-p buffer))
+									(with-current-buffer buffer
+									  (setq git-blame-sidebar--needs-render nil
+											git-blame-sidebar--pending-render-timer nil)
+									  (git-blame-sidebar--update-sidebar buffer))))))))
+				 (when (buffer-live-p (process-buffer p))
+				   (kill-buffer (process-buffer p))))))))))))))
 
 ;;;; Sidebar Buffer Functions
 
@@ -199,126 +498,204 @@ Return nil if not in a git repository or file not tracked."
 	sidebar-buffer))
 
 (defun git-blame-sidebar--render-sidebar (sidebar-buffer blame-data)
-  "Render BLAME-DATA in SIDEBAR-BUFFER."
-  (with-current-buffer sidebar-buffer
-	(let ((inhibit-read-only t)
-		  (max-line (if blame-data (apply #'max (mapcar #'car blame-data)) 0))
-		  (line-num 1))
-	  (erase-buffer)
-	  (dolist (entry blame-data)
-		(let* ((entry-line (nth 0 entry))
-			   (commit (nth 1 entry))
-			   ;; Ensure info is always a string, even if nil
-			   (info (or (nth 2 entry) (format "[No info for %s]" (substring commit 0 7))))
-			   (color (or (nth 3 entry) "#cccccc"))) ; Fallback color
-		  ;; Fill missing lines
-		  (while (< line-num entry-line)
-			(insert "\n")
-			(setq line-num (1+ line-num)))
-		  ;; Insert blame info
-		  (let ((start (point)))
-			(insert (propertize "▌" 'face `(:foreground ,color)))
-			(insert " ")
-			(insert (propertize info 'face `(:foreground ,color)))
-			(add-text-properties start (point)
-								 (list 'commit-hash commit
-									   'line-number entry-line)))
-		  (insert "\n")
-		  (setq line-num (1+ line-num))))
-	  ;; Fill remaining lines up to max-line
-	  (while (<= line-num max-line)
-		(insert "\n")
-		(setq line-num (1+ line-num)))
-	  (goto-char (point-min)))))
+  "Render BLAME-DATA in SIDEBAR-BUFFER without destroying text properties."
+  (let ((source-buffer git-blame-sidebar--global-source-buffer))
+	(when (and source-buffer (buffer-live-p source-buffer))
+	  (git-blame-sidebar--ensure-commit-caches-in-buffer source-buffer))
+
+	(with-current-buffer sidebar-buffer
+	  (let ((inhibit-read-only t)
+			(buffer-undo-list t))
+		(erase-buffer)
+		(setq truncate-lines nil)
+
+		(cond
+		 ((not (and source-buffer (buffer-live-p source-buffer)))
+		  (insert (propertize "❌ No source buffer available" 'face '(:foreground "red"))))
+
+		 ((null blame-data)
+		  (let ((total-lines (with-current-buffer source-buffer
+							   (save-restriction (widen)
+								 (count-lines (point-min) (point-max))))))
+			(when (> total-lines 0)
+			  (insert (propertize "⏳ Loading blame data...\n"
+								  'face '(:weight bold :height 1.2 :background "yellow1" :foreground "black"))))))
+
+		 (t
+		  (let* ((source-total-lines
+				  (with-current-buffer source-buffer
+					(save-restriction (widen)
+					  (count-lines (point-min) (point-max)))))
+				 (blame-alist (cl-loop for entry in blame-data
+									   collect (cons (nth 0 entry) entry)))
+				 (line-num 1))
+
+			(while (<= line-num source-total-lines)
+			  (let ((entry (cdr (assoc line-num blame-alist))))
+				(if entry
+					(let* ((commit (nth 1 entry))
+						   (raw-info (or (nth 2 entry)
+										 (with-current-buffer source-buffer
+										   (gethash commit git-blame-sidebar--commit-info-cache))
+										 (if (with-current-buffer source-buffer
+											 (gethash commit git-blame-sidebar--commit-info-requests))
+											 "[loading...]"
+										   (format "%s..." (substring commit 0 7)))))
+						   (clean-info (string-trim
+										(replace-regexp-in-string "  +" " "
+														  (replace-regexp-in-string "[\15\n\11]+" " " (or raw-info "")))))
+						   (color (or (nth 3 entry)
+									  (with-current-buffer source-buffer
+										(git-blame-sidebar--get-commit-color commit))
+									  "#888888")))
+					  (let ((start (point)))
+						(insert (propertize "▌" 'face `(:foreground ,color)) " ")
+						(insert (propertize clean-info 'face `(:foreground ,color)))
+						(add-text-properties start (point)
+											 `(commit-hash ,commit line-number ,line-num)))
+					  (insert "\n"))
+				  (let ((start (point)))
+					(insert " ")
+					(add-text-properties start (1+ start) `(line-number ,line-num))
+					(insert "\n"))))
+			  (setq line-num (1+ line-num))))))
+
+		(goto-char (point-min))))))
 
 (defun git-blame-sidebar--update-sidebar (source-buffer)
-  "Update sidebar for SOURCE-BUFFER."
-  (when-let* ((blame-data (with-current-buffer source-buffer
-							(or git-blame-sidebar--blame-data
-								(setq git-blame-sidebar--blame-data
-									  (git-blame-sidebar--load-blame-data)))))
-			  (sidebar-buffer git-blame-sidebar--global-sidebar-buffer))
-	(git-blame-sidebar--render-sidebar sidebar-buffer blame-data)))
+  "Update sidebar for SOURCE-BUFFER with safety checks."
+  (git-blame-sidebar--ensure-commit-caches-in-buffer source-buffer)
+
+  (when-let* ((sidebar-buffer git-blame-sidebar--global-sidebar-buffer)
+			  (buffer-live-p sidebar-buffer))
+	(with-current-buffer source-buffer
+	  (if git-blame-sidebar--blame-data
+		  (git-blame-sidebar--render-sidebar sidebar-buffer git-blame-sidebar--blame-data)
+		(git-blame-sidebar--render-sidebar sidebar-buffer nil)))))
+
+;;;; Interaction and hooks
 
 (defun git-blame-sidebar--source-post-command ()
-  "Hook function for source buffer post-command."
+  "Hook function for source buffer post-command with safety checks."
   (when-let* ((sidebar-buffer git-blame-sidebar--global-sidebar-buffer)
+			  (buffer-live-p sidebar-buffer)
 			  (sidebar-window (get-buffer-window sidebar-buffer))
+			  (window-live-p sidebar-window)
 			  (current-line (line-number-at-pos))
 			  (source-buffer (current-buffer)))
-	;; Only update if line number changed
 	(when (/= current-line git-blame-sidebar--last-sync-line)
 	  (setq git-blame-sidebar--last-sync-line current-line)
 	  (let* ((sidebar-line-count (with-current-buffer sidebar-buffer
 								   (count-lines (point-min) (point-max))))
-			 ;; Target line should not exceed sidebar line count
 			 (target-line (min current-line sidebar-line-count)))
 		(with-current-buffer sidebar-buffer
-		  (goto-char (point-min))
-		  (forward-line (max 0 (1- target-line)))
-		  (set-window-point sidebar-window (point)))))))
+		  (condition-case nil
+			  (progn
+				(goto-char (point-min))
+				(forward-line (max 0 (1- target-line)))
+				(set-window-point sidebar-window (point)))
+			(args-out-of-range
+			 (message "Warning: Could not sync to line %d" target-line))))))))
 
 (defun git-blame-sidebar--after-change-function (beg end _)
-  "Function to run after buffer changes."
+  "Do nothing on buffer changes to keep blame stable."
+  ;; Intentionally left blank — do NOT reload blame on edit.
+  )
+
+;;;; Auto-follow logic (NEW)
+
+(defun git-blame-sidebar--on-window-selection-change (&optional _frame)
+  "Called when user selects a different window."
   (when git-blame-sidebar--global-sidebar-buffer
-	;; Cancel any pending timer
-	(when git-blame-sidebar--update-timer
-	  (cancel-timer git-blame-sidebar--update-timer))
-	;; Schedule update after delay
-	(setq git-blame-sidebar--update-timer
-		  (run-with-timer git-blame-sidebar-update-delay nil
-						  (lambda (buffer)
-							(with-current-buffer buffer
-							  (setq git-blame-sidebar--blame-data nil)
-							  (git-blame-sidebar--update-sidebar buffer)))
-						  (current-buffer)))))
+	(when git-blame-sidebar--global-follow-timer
+	  (cancel-timer git-blame-sidebar--global-follow-timer))
+	(setq git-blame-sidebar--global-follow-timer
+		  (run-with-idle-timer
+		   0.05 nil
+		   #'git-blame-sidebar--maybe-switch-to-current-buffer))))
 
-(defun git-blame-sidebar--buffer-switch-hook ()
-  "Hook function to update sidebar when switching buffers."
-  (when (and git-blame-sidebar--global-sidebar-buffer
-			 (buffer-file-name (current-buffer))
-			 (git-blame-sidebar--get-git-root)
-			 (not (eq (current-buffer) git-blame-sidebar--global-source-buffer)))
-	;; Close sidebar for old buffer
-	(when (buffer-live-p git-blame-sidebar--global-source-buffer)
-	  (with-current-buffer git-blame-sidebar--global-source-buffer
-		(remove-hook 'post-command-hook #'git-blame-sidebar--source-post-command t)
-		(remove-hook 'after-change-functions #'git-blame-sidebar--after-change-function t)
-		(setq git-blame-sidebar--buffer nil)))
+(defun git-blame-sidebar--on-window-config-change ()
+  "Fallback hook for cases like `quit-window` that don't trigger selection change."
+  (when git-blame-sidebar--global-sidebar-buffer
+	;; Use the same debounce timer as selection change
+	(when git-blame-sidebar--global-follow-timer
+	  (cancel-timer git-blame-sidebar--global-follow-timer))
+	(setq git-blame-sidebar--global-follow-timer
+		  (run-with-idle-timer
+		   0.05 nil
+		   #'git-blame-sidebar--maybe-switch-to-current-buffer))))
 
-	;; Update global references
-	(setq git-blame-sidebar--global-source-buffer (current-buffer))
+(defun git-blame-sidebar--maybe-switch-to-current-buffer ()
+  "Check if current buffer is a valid Git file and different from sidebar's source."
+  (let* ((current-buf (current-buffer))
+		 (old-source git-blame-sidebar--global-source-buffer))
+	(when (and (buffer-file-name current-buf)
+			   (git-blame-sidebar--get-git-root)
+			   (not (string-prefix-p "*" (buffer-name current-buf)))
+			   (not (eq current-buf old-source))
+			   (not (string-prefix-p "*git-blame:" (buffer-name current-buf))))
+	  (git-blame-sidebar--switch-to-buffer current-buf))))
 
-	;; Setup hooks for new buffer
+(defun git-blame-sidebar--switch-to-buffer (new-buffer)
+  "Switch sidebar to NEW-BUFFER."
+  ;; Clean up old source buffer hooks
+  (when (and git-blame-sidebar--global-source-buffer
+			 (buffer-live-p git-blame-sidebar--global-source-buffer))
 	(with-current-buffer git-blame-sidebar--global-source-buffer
-	  (setq git-blame-sidebar--buffer git-blame-sidebar--global-sidebar-buffer)
-	  (add-hook 'post-command-hook #'git-blame-sidebar--source-post-command nil t)
-	  (add-hook 'after-change-functions #'git-blame-sidebar--after-change-function nil t))
+	  (remove-hook 'post-command-hook #'git-blame-sidebar--source-post-command t)))
 
-	;; Update sidebar content
-	(git-blame-sidebar--update-sidebar git-blame-sidebar--global-source-buffer)
-	))
+  ;; Set new source
+  (setq git-blame-sidebar--global-source-buffer new-buffer)
+
+  (with-current-buffer new-buffer
+	(git-blame-sidebar--ensure-commit-caches-in-buffer new-buffer)
+	(setq git-blame-sidebar--blame-data nil
+		  git-blame-sidebar--last-sync-line 0
+		  git-blame-sidebar--buffer git-blame-sidebar--global-sidebar-buffer)
+	(add-hook 'post-command-hook #'git-blame-sidebar--source-post-command nil t))
+
+  ;; Render loading
+  (git-blame-sidebar--render-sidebar git-blame-sidebar--global-sidebar-buffer nil)
+
+  ;; Start blame
+  (run-with-idle-timer
+   0.01 nil
+   (lambda (buf)
+	 (when (buffer-live-p buf)
+	   (with-current-buffer buf
+		 (let ((total-lines (count-lines (point-min) (point-max))))
+		   (if (> total-lines git-blame-sidebar-max-lines)
+			   (git-blame-sidebar--start-blame-process buf 1 git-blame-sidebar-max-lines)
+			 (git-blame-sidebar--start-blame-process buf nil nil))))))
+   new-buffer))
 
 ;;;; Window Management
 
 (defun git-blame-sidebar--show-sidebar (source-buffer)
-  "Show sidebar for SOURCE-BUFFER."
+  "Show sidebar for SOURCE-BUFFER with safety checks."
+  (git-blame-sidebar--ensure-commit-caches-in-buffer source-buffer)
+
   (let ((sidebar-buffer (or git-blame-sidebar--global-sidebar-buffer
 							(git-blame-sidebar--create-sidebar-buffer source-buffer))))
-	;; Update global references
 	(setq git-blame-sidebar--global-sidebar-buffer sidebar-buffer
 		  git-blame-sidebar--global-source-buffer source-buffer)
 
 	(with-current-buffer source-buffer
 	  (setq git-blame-sidebar--buffer sidebar-buffer
 			git-blame-sidebar--last-sync-line 0)
-	  ;; Add hooks for updates
-	  (add-hook 'post-command-hook #'git-blame-sidebar--source-post-command nil t)
-	  (add-hook 'after-change-functions #'git-blame-sidebar--after-change-function nil t)
-	  (add-hook 'buffer-list-update-hook #'git-blame-sidebar--buffer-switch-hook))
+	  (add-hook 'post-command-hook #'git-blame-sidebar--source-post-command nil t))
 
-	;; Update sidebar content
-	(git-blame-sidebar--update-sidebar source-buffer)
+	;; Start blame process for the whole file
+	(with-current-buffer source-buffer
+	  (setq git-blame-sidebar--blame-data nil)
+	  (if git-blame-sidebar-async
+		  (git-blame-sidebar--start-blame-process source-buffer nil nil)
+		(git-blame-sidebar--fallback-sync-blame source-buffer)))
+
+	;; Register auto-follow hook
+	(add-hook 'window-selection-change-functions #'git-blame-sidebar--on-window-selection-change)
+	;; Fallback for quit-window, winner-undo, etc.
+	(add-hook 'window-configuration-change-hook #'git-blame-sidebar--on-window-config-change)
 
 	;; Display sidebar window
 	(let ((window (display-buffer-in-side-window
@@ -326,9 +703,12 @@ Return nil if not in a git repository or file not tracked."
 				   `((side . ,git-blame-sidebar-position)
 					 (window-width . ,git-blame-sidebar-width)
 					 (slot . 0)
-					 (window-parameters . ((no-other-window . t)))))))
+					 (window-parameters . ((no-other-window . t)
+										  (dedicated . t)))))))
 	  (set-window-dedicated-p window t)
-	  ;; Initial sync
+
+	  (git-blame-sidebar--render-sidebar sidebar-buffer nil)
+
 	  (with-current-buffer source-buffer
 		(git-blame-sidebar--source-post-command)))))
 
@@ -340,43 +720,88 @@ Return nil if not in a git repository or file not tracked."
 		(delete-window window))
 	  (kill-buffer sidebar-buffer))
 	(setq git-blame-sidebar--global-sidebar-buffer nil
-		  git-blame-sidebar--global-source-buffer nil)
+		  git-blame-sidebar--global-source-buffer nil
+		  git-blame-sidebar--global-follow-timer nil)
+	(remove-hook 'window-selection-change-functions #'git-blame-sidebar--on-window-selection-change)
+	(remove-hook 'window-configuration-change-hook #'git-blame-sidebar--on-window-config-change)
 	(with-current-buffer source-buffer
 	  (setq git-blame-sidebar--buffer nil
 			git-blame-sidebar--last-sync-line 0
 			git-blame-sidebar--blame-data nil
-			git-blame-sidebar--commit-colors nil)
+			git-blame-sidebar--commit-colors nil
+			git-blame-sidebar--commit-info-cache nil
+			git-blame-sidebar--commit-info-requests nil)
 	  (remove-hook 'post-command-hook #'git-blame-sidebar--source-post-command t)
 	  (remove-hook 'after-change-functions #'git-blame-sidebar--after-change-function t)
-	  (remove-hook 'buffer-list-update-hook #'git-blame-sidebar--buffer-switch-hook)
 	  (when git-blame-sidebar--update-timer
 		(cancel-timer git-blame-sidebar--update-timer)
 		(setq git-blame-sidebar--update-timer nil)))))
 
+;;;; Commands (copy/diff reuse commit-info-cache)
+
 (defun git-blame-sidebar-copy-commit-hash ()
-  "Copy commit hash at current line."
+  "Copy commit hash for current line.
+Works in source buffer (via blame cache) or sidebar buffer (via text property)."
   (interactive)
-  (let ((commit (if git-blame-sidebar--source-buffer
-					(get-text-property (point) 'commit-hash)
-				  (when-let ((entry (cl-find-if (lambda (e) (= (car e) (line-number-at-pos)))
-												git-blame-sidebar--blame-data)))
-					(nth 1 entry)))))
+  (let (commit)
+	(cond
+	 ((and (boundp 'git-blame-sidebar-mode)
+		   (derived-mode-p 'git-blame-sidebar-mode))
+	  (setq commit (get-text-property (point) 'commit-hash)))
+
+	 ((and (buffer-local-value 'git-blame-sidebar--blame-data (current-buffer))
+		   (not (string-prefix-p "*" (buffer-name))))
+	  (let ((line-num (line-number-at-pos))
+			(blame-data (buffer-local-value 'git-blame-sidebar--blame-data (current-buffer))))
+		(when blame-data
+		  (let ((entry (cl-find-if (lambda (e) (= (car e) line-num)) blame-data)))
+			(setq commit (nth 1 entry))))))
+
+	 ((and git-blame-sidebar--global-source-buffer
+		   (buffer-live-p git-blame-sidebar--global-source-buffer))
+	  (let* ((source-buf git-blame-sidebar--global-source-buffer)
+			 (blame-data (buffer-local-value 'git-blame-sidebar--blame-data source-buf)))
+		(when blame-data
+		  (let ((line-num (with-current-buffer source-buf
+							(line-number-at-pos (window-point)))))
+			(let ((entry (cl-find-if (lambda (e) (= (car e) line-num)) blame-data)))
+			  (setq commit (nth 1 entry))))))))
+
 	(if commit
 		(progn
 		  (kill-new commit)
 		  (message "Copied commit hash: %s" (substring commit 0 8)))
-	  (message "No commit at current line"))))
+	  (message "No blame data available for current line"))))
 
 (defun git-blame-sidebar-show-commit-diff ()
-  "Show diff of commit at current line."
+  "Show diff of commit for current line and switch to it.
+Works in source buffer (via blame cache) or sidebar buffer (via text property)."
   (interactive)
-  (let ((commit
-		 (if (eq major-mode 'git-blame-sidebar-mode)
-			 (get-text-property (point) 'commit-hash)
-		   (when-let ((entry (cl-find-if (lambda (e) (= (car e) (line-number-at-pos)))
-										 git-blame-sidebar--blame-data)))
-			 (nth 1 entry)))))
-	(if commit
+  (let (commit)
+	(cond
+	 ((and (boundp 'git-blame-sidebar-mode)
+		   (derived-mode-p 'git-blame-sidebar-mode))
+	  (setq commit (get-text-property (point) 'commit-hash)))
+
+	 ((and (buffer-local-value 'git-blame-sidebar--blame-data (current-buffer))
+		   (not (string-prefix-p "*" (buffer-name))))
+	  (let ((line-num (line-number-at-pos))
+			(blame-data (buffer-local-value 'git-blame-sidebar--blame-data (current-buffer))))
+		(when blame-data
+		  (let ((entry (cl-find-if (lambda (e) (= (car e) line-num)) blame-data)))
+			(setq commit (nth 1 entry))))))
+
+	 ((and git-blame-sidebar--global-source-buffer
+		   (buffer-live-p git-blame-sidebar--global-source-buffer))
+	  (let* ((source-buf git-blame-sidebar--global-source-buffer)
+			 (blame-data (buffer-local-value 'git-blame-sidebar--blame-data source-buf)))
+		(when blame-data
+		  (let ((line-num (with-current-buffer source-buf
+							(line-number-at-pos (window-point)))))
+			(let ((entry (cl-find-if (lambda (e) (= (car e) line-num)) blame-data)))
+			  (setq commit (nth 1 entry))))))))
+
+	(if (and commit (git-blame-sidebar--get-git-root))
 		(let ((buffer-name (format "*Commit Diff: %s*" (substring commit 0 8))))
 		  (with-current-buffer (get-buffer-create buffer-name)
 			(let ((inhibit-read-only t))
@@ -386,10 +811,11 @@ Return nil if not in a git repository or file not tracked."
 					(diff-mode)
 					(goto-char (point-min))
 					(setq buffer-read-only t)
+					(view-mode 1)
 					(pop-to-buffer buffer-name))
 				(kill-buffer)
 				(message "Failed to show diff for commit %s" commit)))))
-	  (message "No commit at current line"))))
+	  (message "No blame data available for current line"))))
 
 ;;;; Interactive Commands
 
@@ -403,12 +829,51 @@ Return nil if not in a git repository or file not tracked."
 		(git-blame-sidebar--show-sidebar (current-buffer))
 	  (message "Not in a Git repository"))))
 
+(defun git-blame-sidebar-debug-current-state ()
+  "Debug current blame sidebar state."
+  (interactive)
+  (let* ((source-buf (or git-blame-sidebar--global-source-buffer (current-buffer)))
+		 (sidebar-buf git-blame-sidebar--global-sidebar-buffer)
+		 (process (buffer-local-value 'git-blame-sidebar--blame-process source-buf)
+				  )
+		 (data (buffer-local-value 'git-blame-sidebar--blame-data source-buf))
+		 (cache (buffer-local-value 'git-blame-sidebar--commit-info-cache source-buf)))
+	(message "=== GIT BLAME SIDEBAR DEBUG ===")
+	(message "Source buffer: %s" (buffer-name source-buf))
+	(message "Sidebar buffer: %s" (if sidebar-buf (buffer-name sidebar-buf) "nil"))
+	(message "Git root: %s" (git-blame-sidebar--get-git-root))
+	(message "Blame process: %s" (if process (process-status process) "none"))
+	(message "Blame data entries: %s" (if data (length data) "nil"))
+	(message "Commit cache size: %s" (if (and cache (hash-table-p cache))
+										  (hash-table-count cache) "invalid"))
+	(when process
+	  (message "Process command: %s" (process-command process))
+	  (message "Process buffer: %s" (buffer-name (process-buffer process))))
+	(message "=============================")))
+
+;;;###autoload
+(defun git-blame-sidebar-refresh ()
+  "Manually refresh git blame data for current buffer."
+  (interactive)
+  (if (not git-blame-sidebar--global-sidebar-buffer)
+	  (message "Git blame sidebar is not active")
+	(let ((source-buf git-blame-sidebar--global-source-buffer))
+	  (when (buffer-live-p source-buf)
+		(with-current-buffer source-buf
+		  (setq git-blame-sidebar--blame-data nil)
+		  (if git-blame-sidebar-async
+			  (git-blame-sidebar--start-blame-process source-buf nil nil)
+			(git-blame-sidebar--fallback-sync-blame source-buf))
+		  (message "Refreshing git blame data..."))))))
+
 (define-derived-mode git-blame-sidebar-mode special-mode "GitBlame"
   "Major mode for git blame sidebar."
   :group 'git-blame-sidebar
   (setq truncate-lines t)
   (setq-local scroll-margin 0)
-  (setq-local scroll-conservatively 10000))
+  (setq-local scroll-conservatively 10000)
+  (setq-local cursor-type nil)
+  (setq-local mode-line-format nil))
 
 (provide 'git-blame-sidebar)
 ;;; git-blame-sidebar.el ends here
