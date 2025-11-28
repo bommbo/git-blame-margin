@@ -1,14 +1,12 @@
 ;;; git-blame-sidebar.el --- Git blame sidebar like IntelliJ IDEA (robust) -*- lexical-binding: t; -*-
 
 ;; Author: bommbo
-;; Version: 0.2
+;; Version: 0.3
 ;; Package-Requires: ((emacs "27.1"))
 ;; Keywords: git, vc, convenience
 
 ;;; Commentary:
-;; Robust version that handles git blame failures gracefully. Fixed all known issues including
-;; git blame exit code 9, uninitialized hash tables, and rendering problems.
-;; Now supports auto-following the current Git buffer via window selection.
+;; Displays Git blame info for the current line, with support for auto-following the active Git buffer.
 
 ;;; Code:
 
@@ -169,48 +167,116 @@ Set to 0 to blame only the visible window. Increase for more prefetching."
 		  (puthash commit-hash color git-blame-sidebar--commit-colors)
 		  color))))
 
+(defun git-blame-format-relative-time (author-time)
+  "Format AUTHOR-TIME as a natural English relative time string like '3 minutes ago'.
+For time spans >= 2 years, only the year part is shown (months are omitted)."
+  (let* ((now (time-to-seconds (current-time)))
+		 (diff (- now author-time)))
+	(cond
+	 ;; Future or invalid time → fall back to absolute date
+	 ((< diff 0)
+	  (format-time-string "%Y-%m-%d" (seconds-to-time author-time)))
+	 ;; Less than 1 minute
+	 ((< diff 60)
+	  "just now")
+	 ;; Minutes
+	 ((< diff (* 60 60))
+	  (format "%d minute%s ago"
+			  (floor diff 60)
+			  (if (= (floor diff 60) 1) "" "s")))
+	 ;; Hours
+	 ((< diff (* 60 60 24))
+	  (format "%d hour%s ago"
+			  (floor diff (* 60 60))
+			  (if (= (floor diff (* 60 60)) 1) "" "s")))
+	 ;; Days (< 30 days)
+	 ((< diff (* 60 60 24 30))
+	  (format "%d day%s ago"
+			  (floor diff (* 60 60 24))
+			  (if (= (floor diff (* 60 60 24)) 1) "" "s")))
+	 ;; Months (< 1 year)
+	 ((< diff (* 60 60 24 365))
+	  (let ((months (git-blame--months-diff author-time now)))
+		(format "%d month%s ago"
+				months
+				(if (= months 1) "" "s"))))
+	 ;; >= 1 year
+	 (t
+	  (let ((years (git-blame--years-diff author-time now)))
+		(if (>= years 2)
+			;; ≥2 years: only show years
+			(format "%d year%s ago" years (if (= years 1) "" "s"))
+		  ;; 1 year <= span < 2 years: show year + months
+		  (let ((extra-months (- (git-blame--months-diff author-time now) (* years 12))))
+			(if (> extra-months 0)
+				(format "%d year%s %d month%s ago"
+						years (if (= years 1) "" "s")
+						extra-months (if (= extra-months 1) "" "s"))
+			  (format "%d year%s ago" years (if (= years 1) "" "s"))))))))))
+
+(defun git-blame--months-diff (t1 t2)
+  (let* ((d1 (decode-time (seconds-to-time t1)))
+		 (d2 (decode-time (seconds-to-time t2))))
+	(+ (* (- (nth 5 d2) (nth 5 d1)) 12)
+	   (- (nth 4 d2) (nth 4 d1)))))
+
+(defun git-blame--years-diff (t1 t2)
+  (let* ((d1 (decode-time (seconds-to-time t1)))
+		 (d2 (decode-time (seconds-to-time t2))))
+	(let ((y1 (nth 5 d1)) (m1 (nth 4 d1)) (d1-day (nth 3 d1))
+		  (y2 (nth 5 d2)) (m2 (nth 4 d2)) (d2-day (nth 3 d2)))
+	  (let ((years (- y2 y1)))
+		(if (or (< m2 m1)
+				(and (= m2 m1) (< d2-day d1-day)))
+			(1- years)
+		  years)))))
+
 ;;;; Parsing Helpers (operate on strings)
 
-(defun git-blame-sidebar--parse-blame-output (output)
-  "Parse OUTPUT string from `git blame --porcelain' into blame-data list."
-  (let ((buffer (current-buffer)))
-	(git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
+(defun git-blame-sidebar--parse-blame-output (output source-buffer)
+  "Parse --line-porcelain output to extract commit info directly."
+  (with-temp-buffer
+	(insert output)
+	(goto-char (point-min))
+	(let ((blame-data '())
+		  (current-commit nil)
+		  (current-line-num nil)
+		  (author nil)
+		  (author-time nil))
+	  (while (not (eobp))
+		(let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
+		  (cond
+		   ;; Commit header: HASH original-line final-line [num-lines]
+		   ((string-match "^\\([a-f0-9]\\{40\\}\\) \\([0-9]+\\) \\([0-9]+\\)" line)
+			(setq current-commit (match-string 1 line)
+				  current-line-num (string-to-number (match-string 3 line)))
+			(setq author nil author-time nil))
 
-	(with-temp-buffer
-	  (insert output)
-	  (goto-char (point-min))
-	  (let ((blame-data nil)
-			(current-commit nil)
-			(current-line-num nil)
-			(commits-to-fetch nil))
+		   ;; Metadata lines
+		   ((string-match "^author \\(.+\\)" line)
+			(setq author (match-string 1 line)))
+		   ((string-match "^author-time \\([0-9]+\\)" line)
+			(setq author-time (string-to-number (match-string 1 line))))
 
-		(while (not (eobp))
-		  (let ((line (buffer-substring-no-properties (line-beginning-position) (line-end-position))))
-			(cond
-			 ;; Commit header line: hash original-line final-line num-lines
-			 ((string-match "^\\([a-f0-9]\\{40\\}\\) \\([0-9]+\\) \\([0-9]+\\)\\(?: \\([0-9]+\\)\\)?$" line)
-			  (setq current-commit (match-string 1 line)
-					current-line-num (string-to-number (match-string 3 line)))
-			  (push current-commit commits-to-fetch))
+		   ;; Code line (starts with tab)
+		   ((string-prefix-p "\t" line)
+			(when (and current-commit current-line-num)
+			  (let* ((short-hash (substring current-commit 0 7))
+					 (display-author (or author "Unknown"))
+					 (display-time (if author-time
+									   (git-blame-format-relative-time author-time)
+									 "Unknown"))
+					 (info-string (format "%s %s %s"
+										  short-hash
+										  display-author
+										  display-time)))
+				(push (list current-line-num current-commit info-string nil) blame-data)
+				(setq current-line-num (1+ current-line-num)))))
 
-			 ;; Code line (starts with tab)
-			 ((string-match "^\t" line)
-			  (when (and current-commit current-line-num)
-				(push (list current-line-num current-commit nil nil) blame-data)
-				(setq current-line-num (1+ current-line-num))))
-
-			 ;; Ignore other metadata lines
-			 (t nil)))
-		  (forward-line 1))
-
-		;; Request info for all unique commits
-		(dolist (commit (delete-dups commits-to-fetch))
-		  (with-current-buffer buffer
-			(git-blame-sidebar--ensure-commit-caches-in-buffer buffer)
-			(unless (gethash commit git-blame-sidebar--commit-info-cache)
-			  (git-blame-sidebar--request-commit-info-async commit buffer))))
-
-		(nreverse blame-data)))))
+		   ;; Ignore all other lines (committer, filename, etc.)
+		   (t nil)))
+		(forward-line 1))
+	  (nreverse blame-data))))
 
 ;;;; Git Operations (robust versions)
 
@@ -290,7 +356,7 @@ Return (exit-code output) or nil if git root not found."
 		(cl-return-from git-blame-sidebar--start-blame-process nil))
 
 	  (let* ((default-directory git-root)
-			 (cmd (append (list "git" "blame" "--porcelain")
+			 (cmd (append (list "git" "blame" "--line-porcelain")
 						  (when (and start end) (list (format "-L%d,%d" start end)))
 						  (list relative-file)))
 			 (process-connection-type nil)
@@ -329,7 +395,7 @@ Return (exit-code output) or nil if git root not found."
 							 (progn
 							   (message "[DEBUG] Parsing output...")
 							   (setq git-blame-sidebar--blame-data
-									 (git-blame-sidebar--parse-blame-output out))
+									 (git-blame-sidebar--parse-blame-output out buffer))
 							   (setq git-blame-sidebar--last-failed-range nil)
 							   (message "[DEBUG] SUCCESS: Parsed %d lines"
 										(length git-blame-sidebar--blame-data)))
@@ -390,7 +456,7 @@ Return (exit-code output) or nil if git root not found."
 			   (error (nth 2 result)))
 		  (if (and (= exit-code 0) (not (string-empty-p output)))
 			  (progn
-				(setq git-blame-sidebar--blame-data (git-blame-sidebar--parse-blame-output output))
+				(setq git-blame-sidebar--blame-data (git-blame-sidebar--parse-blame-output output source-buffer))
 				(message "Fallback to synchronous blame succeeded"))
 			(progn
 			  (setq git-blame-sidebar--blame-data nil)
@@ -534,13 +600,7 @@ Return (exit-code output) or nil if git root not found."
 			  (let ((entry (cdr (assoc line-num blame-alist))))
 				(if entry
 					(let* ((commit (nth 1 entry))
-						   (raw-info (or (nth 2 entry)
-										 (with-current-buffer source-buffer
-										   (gethash commit git-blame-sidebar--commit-info-cache))
-										 (if (with-current-buffer source-buffer
-											 (gethash commit git-blame-sidebar--commit-info-requests))
-											 "[loading...]"
-										   (format "%s..." (substring commit 0 7)))))
+						   (raw-info (or (nth 2 entry) (format "%s..." (substring commit 0 7))))
 						   (clean-info (string-trim
 										(replace-regexp-in-string "  +" " "
 														  (replace-regexp-in-string "[\15\n\11]+" " " (or raw-info "")))))
