@@ -263,28 +263,22 @@
 ;;;; Loading Strategy
 
 (defun git-blame-margin--load-initial ()
-  "Load blame data with smart strategy."
-  (let ((use-lazy (git-blame-margin--should-use-lazy-p)))
-	(if use-lazy
-		(let* ((range (git-blame-margin--get-visible-range))
-			   (start (car range))
-			   (end (cdr range)))
-		  ;; Load visible area first
-		  (git-blame-margin--start-blame-process (current-buffer) start end)
-		  ;; Load rest in background after short delay
-		  (run-with-idle-timer
-		   0.5 nil
-		   (lambda (buf)
-			 (when (and (buffer-live-p buf)
-						(with-current-buffer buf
-						  (and git-blame-margin--cache
-							   (not git-blame-margin--cache-complete-p))))
-			   (with-current-buffer buf
-				 (message "Git blame: loading remaining lines in background...")
-				 (git-blame-margin--start-blame-process buf nil nil))))
-		   (current-buffer)))
-	  ;; Small file: load everything immediately
-	  (git-blame-margin--start-blame-process (current-buffer) nil nil))))
+  "Load blame data. Always start with visible area, then full in background."
+  (let* ((range (git-blame-margin--get-visible-range))
+		 (start (car range))
+		 (end (cdr range)))
+	(git-blame-margin--start-blame-process (current-buffer) start end)
+	(run-with-idle-timer
+	 0.5 nil
+	 (lambda (buf)
+	   (when (and (buffer-live-p buf)
+				  (with-current-buffer buf
+					(and git-blame-margin--enabled-p
+						 (not git-blame-margin--cache-complete-p))))
+		 (with-current-buffer buf
+		   (minibuffer-message "Git blame: loading full file in background...")
+		   (git-blame-margin--start-blame-process buf nil nil))))
+	 (current-buffer))))
 
 ;;;; Show/Hide Helpers
 
@@ -361,13 +355,15 @@
 
 ;;;; Edit Detection
 
-(defun git-blame-margin--on-buffer-change (&rest _)
-  "Hide margin when buffer is modified."
-  (when (and git-blame-margin--enabled-p
-			 git-blame-margin--currently-visible-p
-			 (buffer-modified-p))
-	(git-blame-margin--hide-display)
-	(message "Git blame: hidden (editing)")))
+(defun git-blame-margin--on-buffer-change (beg end prev-len)
+  "Hide margin when buffer is modified; auto-show if becomes clean (e.g., after undo)."
+  (when git-blame-margin--enabled-p
+	(if (buffer-modified-p)
+		(when git-blame-margin--currently-visible-p
+		  (git-blame-margin--hide-display)
+		  (minibuffer-message "Git blame: hidden (editing)"))
+	  (unless git-blame-margin--currently-visible-p
+		(git-blame-margin--show-display)))))
 
 (defun git-blame-margin--on-after-save ()
   "Reload and show margin after save."
@@ -477,6 +473,7 @@
   (setq git-blame-margin--enabled-p t)
   (git-blame-margin--show-display)
   (git-blame-margin--load-initial)
+  (git-blame-margin--start-blame-process (current-buffer) nil nil)
   (add-hook 'after-change-functions #'git-blame-margin--on-buffer-change nil t)
   (add-hook 'window-scroll-functions #'git-blame-margin--on-scroll nil t)
   (add-hook 'after-save-hook #'git-blame-margin--on-after-save nil t))
