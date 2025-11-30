@@ -248,10 +248,11 @@
 					 (with-current-buffer source-buf
 					   (setq git-blame-margin--blame-process nil)))))))
 
-			(message "Git blame: loading%s..."
+			(minibuffer-message
+			 (format "Git blame: loading%s..."
 					 (if (and start end)
 						 (format " lines %d-%d" start end)
-					   " entire file")))
+					   " entire file"))))
 
 		(error
 		 (message "Git blame error: %s" err)
@@ -379,7 +380,7 @@
 	  (setq git-blame-margin--blame-process nil))
 	(git-blame-margin--show-display)
 	(git-blame-margin--load-initial)
-	(message "Git blame: reloaded")))
+	(minibuffer-message "Git blame: reloaded")))
 
 ;;;; Render with Text Properties
 
@@ -422,7 +423,7 @@
 					  (forward-line 1))))
 
 	  (when (> count 0)
-		(message "Git blame: rendered %d lines" count)))))
+		(minibuffer-message (format "Git blame: rendered %d lines" count))))))
 
 ;;;; Scroll Handler
 
