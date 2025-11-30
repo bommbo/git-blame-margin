@@ -1,9 +1,8 @@
-# git-blame-sidebar
-Display git blame information in a sidebar, similar to IntelliJ IDEA
+# git-blame-margin
+Display git blame information in margin, similar to IntelliJ IDEA
 
  Command
  --
-  - git-blame-sidebar-toggle - Toggle sidebar
-  - git-blame-sidebar-refresh - refresh sidebar
-  - git-blame-sidebar-copy-commit-hash - Copy commit hash
-  - git-blame-sidebar-show-commit-diff - Show commit diff
+  - git-blame-margin-toggle - Toggle margin
+  - git-blame-margin-copy-commit-hash - Copy commit hash
+  - git-blame-margin-show-commit-diff - Show commit diff
