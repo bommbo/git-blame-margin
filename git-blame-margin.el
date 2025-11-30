@@ -290,12 +290,16 @@
 (defun git-blame-margin--clear-display ()
   "Clear margin display by removing text properties."
   (let ((inhibit-read-only t)
-		(inhibit-modification-hooks t))
+		(inhibit-modification-hooks t)
+		
+		(was-modified (buffer-modified-p)))
 	(save-excursion
 	  (save-restriction
 		(widen)
 		(remove-text-properties (point-min) (point-max)
-								'(line-prefix nil))))))
+								'(line-prefix nil))))
+	
+	(set-buffer-modified-p was-modified)))
 
 (defun git-blame-margin--hide-display ()
   "Hide the margin display (but keep enabled state)."
@@ -406,7 +410,8 @@
 		   (end-line (cdr range))
 		   (count 0)
 		   (inhibit-read-only t)
-		   (inhibit-modification-hooks t))
+		   (inhibit-modification-hooks t)
+		   (was-modified (buffer-modified-p)))
 
 	  (save-excursion
 		(goto-char (point-min))
@@ -424,6 +429,8 @@
 									   `((margin left-margin) ,margin-text)))
 						  (setq count (1+ count))))
 					  (forward-line 1))))
+
+	  (set-buffer-modified-p was-modified)
 
 	  (when (> count 0)
 		(minibuffer-message (format "Git blame: rendered %d lines" count))))))
