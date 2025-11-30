@@ -498,33 +498,19 @@
 
 ;;;###autoload
 (defun git-blame-margin-toggle ()
-  "Toggle git blame margin globally for all git buffers."
+  "Toggle git blame margin for CURRENT buffer only."
   (interactive)
-  (if git-blame-margin--global-enabled
-	  ;; Turn off globally
+  (if git-blame-margin--enabled-p
+	  ;; OFF: use same logic as edit
 	  (progn
-		(setq git-blame-margin--global-enabled nil)
-		;; Disable for all buffers
-		(dolist (buf (buffer-list))
-		  (when (buffer-live-p buf)
-			(with-current-buffer buf
-			  (when git-blame-margin--enabled-p
-				(git-blame-margin--disable-for-buffer)))))
-		;; Remove global hooks
-		(remove-hook 'buffer-list-update-hook #'git-blame-margin--on-buffer-switch)
-		(remove-hook 'window-configuration-change-hook #'git-blame-margin--on-buffer-switch)
-		(message "Git blame: OFF (globally)"))
-	;; Turn on globally
+		(git-blame-margin--disable-for-buffer)
+		(message "Git blame: OFF (current buffer)"))
+	;; ON: enable manually
 	(if (not (and (buffer-file-name)
 				  (vc-git-registered (buffer-file-name))))
 		(message "Not a git file")
-	  (setq git-blame-margin--global-enabled t)
-	  ;; Enable for current buffer
 	  (git-blame-margin--enable-for-buffer)
-	  ;; Add global hooks
-	  (add-hook 'buffer-list-update-hook #'git-blame-margin--on-buffer-switch)
-	  (add-hook 'window-configuration-change-hook #'git-blame-margin--on-buffer-switch)
-	  (message "Git blame: ON (globally)"))))
+	  (message "Git blame: ON (current buffer)"))))
 
 (provide 'git-blame-margin)
 ;;; git-blame-margin.el ends here
