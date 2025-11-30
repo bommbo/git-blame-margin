@@ -233,13 +233,16 @@
 							  (= exit-code 0)
 							  (> (length output) 100))
 					 (with-current-buffer source-buf
-					   (let ((count (git-blame-margin--parse-porcelain output source-buf)))
-						 (unless is-partial
-						   (setq git-blame-margin--cache-complete-p t))
-						 (git-blame-margin--render-visible)
-						 (message "Git blame: loaded %d lines%s"
-								  count
-								  (if is-partial " (partial)" "")))))
+					   ;; Check if still enabled before rendering
+					   (when (and git-blame-margin--enabled-p
+								  git-blame-margin--global-enabled)
+						 (let ((count (git-blame-margin--parse-porcelain output source-buf)))
+						   (unless is-partial
+							 (setq git-blame-margin--cache-complete-p t))
+						   (git-blame-margin--render-visible)
+						   (message "Git blame: loaded %d lines%s"
+									count
+									(if is-partial " (partial)" ""))))))
 
 				   (when (buffer-live-p (process-buffer p))
 					 (kill-buffer (process-buffer p)))
@@ -273,7 +276,9 @@
 	 (lambda (buf)
 	   (when (and (buffer-live-p buf)
 				  (with-current-buffer buf
+					;; Check if still enabled before loading full file
 					(and git-blame-margin--enabled-p
+						 git-blame-margin--global-enabled
 						 (not git-blame-margin--cache-complete-p))))
 		 (with-current-buffer buf
 		   (minibuffer-message "Git blame: loading full file in background...")
@@ -332,25 +337,27 @@
 			   (when (and (buffer-live-p buf)
 						  (eq buf (current-buffer)))
 				 (with-current-buffer buf
-				   ;; Auto-enable for git files if not already enabled
-				   (when (and (buffer-file-name)
-							  (vc-git-registered (buffer-file-name))
-							  (not git-blame-margin--enabled-p)
-							  (not (string-prefix-p " " (buffer-name)))
-							  (not (string-prefix-p "*" (buffer-name))))
-					 ;; Load full file when switching, not just visible range
-					 (setq git-blame-margin--enabled-p t)
-					 (git-blame-margin--show-display)
-					 (add-hook 'after-change-functions #'git-blame-margin--on-buffer-change nil t)
-					 (add-hook 'window-scroll-functions #'git-blame-margin--on-scroll nil t)
-					 (add-hook 'after-save-hook #'git-blame-margin--on-after-save nil t)
-					 ;; Always load full file on switch, ignoring lazy threshold
-					 (git-blame-margin--start-blame-process buf nil nil))
-				   ;; Restore display if already enabled but hidden
-				   (when (and git-blame-margin--enabled-p
-							  (not (buffer-modified-p))
-							  (not git-blame-margin--currently-visible-p))
-					 (git-blame-margin--show-display)))))
+				   ;; Check global toggle before auto-enabling
+				   (when git-blame-margin--global-enabled
+					 ;; Auto-enable for git files if not already enabled
+					 (when (and (buffer-file-name)
+								(vc-git-registered (buffer-file-name))
+								(not git-blame-margin--enabled-p)
+								(not (string-prefix-p " " (buffer-name)))
+								(not (string-prefix-p "*" (buffer-name))))
+					   ;; Load full file when switching, not just visible range
+					   (setq git-blame-margin--enabled-p t)
+					   (git-blame-margin--show-display)
+					   (add-hook 'after-change-functions #'git-blame-margin--on-buffer-change nil t)
+					   (add-hook 'window-scroll-functions #'git-blame-margin--on-scroll nil t)
+					   (add-hook 'after-save-hook #'git-blame-margin--on-after-save nil t)
+					   ;; Always load full file on switch, ignoring lazy threshold
+					   (git-blame-margin--start-blame-process buf nil nil))
+					 ;; Restore display if already enabled but hidden
+					 (when (and git-blame-margin--enabled-p
+								(not (buffer-modified-p))
+								(not git-blame-margin--currently-visible-p))
+					   (git-blame-margin--show-display))))))
 			 current-buf)))))
 
 ;;;; Edit Detection
@@ -431,7 +438,11 @@
 		(run-with-idle-timer
 		 0.1 nil
 		 (lambda (buf)
-		   (when (buffer-live-p buf)
+		   (when (and (buffer-live-p buf)
+					  (with-current-buffer buf
+						;; Check if still enabled before rendering
+						(and git-blame-margin--enabled-p
+							 git-blame-margin--global-enabled)))
 			 (with-current-buffer buf
 			   (when git-blame-margin--cache
 				 (git-blame-margin--render-visible)))))
@@ -473,7 +484,6 @@
   (setq git-blame-margin--enabled-p t)
   (git-blame-margin--show-display)
   (git-blame-margin--load-initial)
-  (git-blame-margin--start-blame-process (current-buffer) nil nil)
   (add-hook 'after-change-functions #'git-blame-margin--on-buffer-change nil t)
   (add-hook 'window-scroll-functions #'git-blame-margin--on-scroll nil t)
   (add-hook 'after-save-hook #'git-blame-margin--on-after-save nil t))
@@ -503,14 +513,21 @@
   (if git-blame-margin--global-enabled
 	  ;; OFF globally
 	  (progn
+		;; 1. Set global flag to nil first
 		(setq git-blame-margin--global-enabled nil)
+		;; 2. Remove global hooks immediately
+		(remove-hook 'buffer-list-update-hook #'git-blame-margin--on-buffer-switch)
+		(remove-hook 'window-configuration-change-hook #'git-blame-margin--on-buffer-switch)
+		;; 3. Cancel buffer-switch timer
+		(when git-blame-margin--buffer-switch-timer
+		  (cancel-timer git-blame-margin--buffer-switch-timer)
+		  (setq git-blame-margin--buffer-switch-timer nil))
+		;; 4. Disable blame for all buffers
 		(dolist (buf (buffer-list))
 		  (when (buffer-live-p buf)
 			(with-current-buffer buf
 			  (when git-blame-margin--enabled-p
 				(git-blame-margin--disable-for-buffer)))))
-		(remove-hook 'buffer-list-update-hook #'git-blame-margin--on-buffer-switch)
-		(remove-hook 'window-configuration-change-hook #'git-blame-margin--on-buffer-switch)
 		(message "Git blame: OFF (globally)"))
 	;; ON globally
 	(if (not (and (buffer-file-name)
