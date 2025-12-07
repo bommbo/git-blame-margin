@@ -74,5 +74,98 @@ Relies on git-blame-margin being enabled and cache populated."
 				  (message "Failed to run `git show %s`" (substring commit 0 8)))))))
 	  (message "No Git blame data available for current line (margin not loaded?)"))))
 
+;;;###autoload
+(defun git-blame-margin-jump ()
+  "Show timeline and jump to selected line."
+  (interactive)
+  (unless git-blame-margin--cache
+    (user-error "Git blame data not loaded"))
+  
+  (let ((date-to-line (make-hash-table :test 'equal))
+        choices)
+    
+    ;; Collect minimum line number for each date
+    (maphash
+     (lambda (line-num data)
+       (let* ((date (nth 2 data))
+              (existing-line (gethash date date-to-line)))
+         (when (or (not existing-line) (< line-num existing-line))
+           (puthash date line-num date-to-line))))
+     git-blame-margin--cache)
+    
+    ;; Convert hash to list and format display
+    (maphash
+     (lambda (date line-num)
+       (let* ((data (git-blame-margin--cache-get line-num))
+              (commit-hash (nth 0 data))
+              (author (nth 1 data))
+              (summary (nth 3 data))
+              (short-hash (substring commit-hash 0 7))
+              (display (format "%s %s L%-5d %s %s"
+                               short-hash date line-num author summary)))
+         (push (list date display line-num) choices)))
+     date-to-line)
+    
+    ;; Sort by date field (newest first)
+    (setq choices (sort choices (lambda (a b) 
+                                  (string> (nth 0 a) (nth 0 b)))))
+    
+    ;; Build alist: (display . line-num)
+    (setq choices (mapcar (lambda (x) 
+                            (cons (nth 1 x) (nth 2 x)))
+                          choices))
+    
+    (if (not choices)
+        (user-error "No data available")
+      (let* ((display-list (mapcar #'car choices))
+             (completion-styles '(basic))
+             (vertico-sort-function nil)
+             (selection (let ((completing-read-function #'completing-read-default))
+                          (completing-read "Jump to: " display-list nil t)))
+             (line-num (cdr (assoc selection choices))))
+        (goto-char (point-min))
+        (forward-line (1- line-num))
+        (recenter)
+        (message "Line %d" line-num)))))
+
+(defun git-blame-margin--jump-to-commit-line (direction)
+  "Jump to another line in the same commit.
+DIRECTION should be 1 for next, -1 for previous."
+  (interactive)
+  (let* ((line (line-number-at-pos))
+         (entry (git-blame-margin--cache-get line)))
+    (unless entry
+      (user-error "No blame info at this line"))
+    (let* ((commit (car entry))
+           (lines '()))
+
+      ;; Collect all lines for the same commit
+      (maphash (lambda (ln data)
+                 (when (equal (car data) commit)
+                   (push ln lines)))
+               git-blame-margin--cache)
+
+      (setq lines (sort lines #'<))
+
+      ;; Find next/prev
+      (let* ((pos (cl-position line lines))
+             (target
+              (if (null pos)
+                  (user-error "Current line not found in commit list")
+                (nth (+ pos direction) lines))))
+        (if target
+            (goto-char (point-min))
+          (user-error "No more lines in this commit"))
+        (forward-line (1- target))
+        (message "Jumped to line %d (commit %s)" target commit)))))
+
+(defun git-blame-margin-next-commit-line ()
+  (interactive)
+  (git-blame-margin--jump-to-commit-line 1))
+
+(defun git-blame-margin-prev-commit-line ()
+  (interactive)
+  (git-blame-margin--jump-to-commit-line -1))
+
 (provide 'git-blame-margin-extensions)
 ;;; git-blame-margin-extensions.el ends here
