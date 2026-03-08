@@ -68,6 +68,10 @@
 
 (defvar-local git-blame-margin--scroll-timer nil)
 
+
+(defvar-local git-blame-margin--fully-rendered-p nil
+  "t if entire buffer has been fully rendered; scroll events are skipped.")
+
 ;;;; Color
 
 (defun git-blame-margin--hash-to-color (commit-hash)
@@ -402,58 +406,74 @@
 
 (defun git-blame-margin--render-visible ()
   "Render blame info for visible lines using text properties."
+  ;; If already fully rendered, nothing to do
+  (when git-blame-margin--fully-rendered-p
+    (cl-return-from git-blame-margin--render-visible nil))
+  
   (git-blame-margin--clear-display)
-
+  
   (when git-blame-margin--cache
-	(let* ((range (git-blame-margin--get-visible-range))
-		   (start-line (car range))
-		   (end-line (cdr range))
-		   (count 0)
-		   (inhibit-read-only t)
-		   (inhibit-modification-hooks t)
-		   (was-modified (buffer-modified-p)))
-
-	  (save-excursion
-		(goto-char (point-min))
-		(forward-line (1- start-line))
-
-		(cl-loop for line from start-line to end-line
-				 while (not (eobp))
-				 do (progn
-					  (when-let ((data (git-blame-margin--cache-get line)))
-						(let* ((pos (line-beginning-position))
-							   (margin-text (apply #'git-blame-margin--create-margin-text data)))
-						  (put-text-property
-						   pos (1+ pos) 'line-prefix
-						   (propertize " " 'display
-									   `((margin left-margin) ,margin-text)))
-						  (setq count (1+ count))))
-					  (forward-line 1))))
-
-	  (set-buffer-modified-p was-modified)
-
-	  (when (> count 0)
-		(minibuffer-message (format "Git blame: rendered %d lines" count))))))
+    (let* ((use-full git-blame-margin--cache-complete-p)
+           (range (if use-full
+                      (cons 1 (line-number-at-pos (point-max)))
+                    (git-blame-margin--get-visible-range)))
+           (start-line (car range))
+           (end-line (cdr range))
+           (count 0)
+           (inhibit-read-only t)
+           (inhibit-modification-hooks t)
+           (was-modified (buffer-modified-p)))
+      
+      (save-excursion
+        (goto-char (point-min))
+        (forward-line (1- start-line))
+        (cl-loop for line from start-line to end-line
+                 while (not (eobp))
+                 do (progn
+                      (when-let ((data (git-blame-margin--cache-get line)))
+                        (let* ((pos (line-beginning-position))
+                               (margin-text (apply #'git-blame-margin--create-margin-text data)))
+                          (put-text-property
+                           pos (1+ pos) 'line-prefix
+                           (propertize " " 'display
+                                       `((margin left-margin) ,margin-text)))
+                          (setq count (1+ count))))
+                      (forward-line 1))))
+      
+      (set-buffer-modified-p was-modified)
+      
+      ;; Mark fully rendered only when entire file is done
+      (when use-full
+        (setq git-blame-margin--fully-rendered-p t))
+      
+      (when (> count 0)
+        (minibuffer-message
+         (format "Git blame: rendered %d lines%s"
+                 count
+                 (if use-full " (complete)" "")))))))
 
 ;;;; Scroll Handler
 
 (defun git-blame-margin--on-scroll (&rest _)
   "Handle scroll events with debouncing."
-  (when git-blame-margin--scroll-timer
-	(cancel-timer git-blame-margin--scroll-timer))
-  (setq git-blame-margin--scroll-timer
-		(run-with-idle-timer
-		 0.1 nil
-		 (lambda (buf)
-		   (when (and (buffer-live-p buf)
-					  (with-current-buffer buf
-						;; Check if still enabled before rendering
-						(and git-blame-margin--enabled-p
-							 git-blame-margin--global-enabled)))
-			 (with-current-buffer buf
-			   (when git-blame-margin--cache
-				 (git-blame-margin--render-visible)))))
-		 (current-buffer))))
+  ;; Skip entirely if already fully rendered
+  (when (and git-blame-margin--enabled-p
+             (not git-blame-margin--fully-rendered-p))
+    (when git-blame-margin--scroll-timer
+      (cancel-timer git-blame-margin--scroll-timer))
+    (setq git-blame-margin--scroll-timer
+          (run-with-idle-timer
+           0.1 nil
+           (lambda (buf)
+             (when (and (buffer-live-p buf)
+                        (with-current-buffer buf
+                          (and git-blame-margin--enabled-p
+                               git-blame-margin--global-enabled
+                               (not git-blame-margin--fully-rendered-p))))
+               (with-current-buffer buf
+                 (when git-blame-margin--cache
+                   (git-blame-margin--render-visible)))))
+           (current-buffer)))))
 
 ;;;; Commands
 
@@ -511,7 +531,8 @@
 		git-blame-margin--cache-complete-p nil
 		git-blame-margin--commit-colors nil
 		git-blame-margin--enabled-p nil
-		git-blame-margin--currently-visible-p nil))
+		git-blame-margin--currently-visible-p nil
+		git-blame-margin--fully-rendered-p nil))
 
 ;;;###autoload
 (defun git-blame-margin-toggle ()
