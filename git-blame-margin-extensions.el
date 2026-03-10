@@ -167,5 +167,21 @@ DIRECTION should be 1 for next, -1 for previous."
   (interactive)
   (git-blame-margin--jump-to-commit-line -1))
 
+;;;###autoload
+(defun git-blame-margin-show-commit-in-magit-log ()
+  "Open magit-log and jump to the commit at current line."
+  (interactive)
+  (let* ((line (line-number-at-pos))
+         (data (git-blame-margin--cache-get line)))
+    (if (not data)
+        (message "No blame data for this line (still loading?)")
+      (let ((commit-hash (car data)))
+        (if (not (fboundp 'magit-log-head))
+            (message "Magit not available")
+          (save-selected-window
+            (magit-log-other (list commit-hash)
+                             '("--" "--ancestry-path")
+                             (list (buffer-file-name)))))))))
+
 (provide 'git-blame-margin-extensions)
 ;;; git-blame-margin-extensions.el ends here
